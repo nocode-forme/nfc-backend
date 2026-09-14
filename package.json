@@ -1,0 +1,12 @@
+{
+  "name": "utep-game-server",
+  "version": "0.1.0",
+  "description": "国际交换项目对弈原型:回合调度 + 数据透传服务器",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
