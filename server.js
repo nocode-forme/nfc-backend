@@ -1,70 +1,128 @@
 /**
- * 对弈原型服务器
+ * 对弈原型服务器(Redis 版)
  * 职责:回合制调度 + 数据透传 + 局内元数据维护
  * 非职责:AI 决策、胜负判定、渲染、业务数据格式定义(全部由客户端自理)
  *
+ * 改动说明:
+ *   房间的「元数据」(turn/history/state/rematch/...)现在存在 Redis 里,
+ *   服务器重启、崩溃、pm2 restart 都不会丢失正在进行的对局。
+ *
+ *   但 WebSocket 连接本身(ws 对象)无法序列化进 Redis —— 一个连接只属于
+ *   当前这一个 Node 进程。所以「谁的 socket 坐在哪个座位」仍然只放在本地
+ *   内存的 socketsByRoom 里,不进 Redis。
+ *
+ *   换句话说:断线后房间的棋局状态从 Redis 读回来,但重连的人必须连回
+ *   同一台服务器进程,座位才能重新绑定上——这对单机部署完全没问题,
+ *   多机横向扩展则需要额外的会话粘滞(sticky session)方案,这里先不做。
+ *
  * 通信:WebSocket + JSON,消息统一形如 { "type": "...", ...字段 }
- * 完整接口说明见 API.md
  */
 const http = require('http');
-const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
+const { createClient } = require('redis');
 
 const PORT = process.env.PORT || 8080;
+const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 // 断线后房间保留多久(毫秒):期间重新入座可继续没下完的局,超时则释放房间
 const RESUME_TIMEOUT_MS = Number(process.env.RESUME_TIMEOUT_MS || 30 * 60 * 1000);
+const ROOM_KEY_PREFIX = 'gomoku:room:';
+const ROOM_TTL_SEC = Math.ceil(RESUME_TIMEOUT_MS / 1000) + 60; // 比保留期稍长一点做缓冲
 
-// ---------------- 房间模型 ----------------
-// rooms: Map<roomId, room>
-// room = {
-//   id, seats: { A: ws|null, B: ws|null },
-//   turn: 'A'|'B'|null,      当前行动权
-//   turnCount: number,        已落下步数(每 move +1)
-//   history: [{seat,payload,turnCount}],  透传 payload 原样保存
+// ---------------- Redis 连接 ----------------
+const redis = createClient({ url: REDIS_URL });
+redis.on('error', (err) => console.error('[redis] error:', err));
+
+// ---------------- 房间模型(元数据存 Redis,socket 引用存本地) ----------------
+// Redis 里的 room 结构(纯 JSON,可序列化):
+// {
+//   id, turn: 'A'|'B'|null, turnCount, history: [{seat,payload,turnCount}],
 //   state: 'waiting'|'playing'|'over',
-//   rematch: { A: bool, B: bool },  终局后双方是否已请求再来一局
-//   firstMover: 'A'|'B',            下一局先手方(每开一局自动轮换,先后手交替)
+//   rematch: { A: bool, B: bool },
+//   firstMover: 'A'|'B',
+//   seatsOccupied: { A: bool, B: bool },  // 只记录"是否有人坐",不存 ws 本身
 //   createdAt
 // }
-const rooms = new Map();
+//
+// socketsByRoom: Map<roomId, { A: ws|null, B: ws|null }>  —— 本地内存,不落 Redis
+const socketsByRoom = new Map();
 
 function newRoomId() {
-  // 6 位大写十六进制房间号,便于口头/文字转告对方
   return crypto.randomBytes(3).toString('hex').toUpperCase();
 }
 
-function joinSeat(room, ws, seat) {
+async function getRoom(roomId) {
+  const raw = await redis.get(ROOM_KEY_PREFIX + roomId);
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function saveRoom(room) {
+  await redis.set(ROOM_KEY_PREFIX + room.id, JSON.stringify(room), { EX: ROOM_TTL_SEC });
+}
+
+async function deleteRoom(roomId) {
+  await redis.del(ROOM_KEY_PREFIX + roomId);
+  socketsByRoom.delete(roomId);
+}
+
+function getSockets(roomId) {
+  if (!socketsByRoom.has(roomId)) socketsByRoom.set(roomId, { A: null, B: null });
+  return socketsByRoom.get(roomId);
+}
+
+async function joinSeat(room, ws, seat) {
   if (room._resumeTimer) {
     clearTimeout(room._resumeTimer);
     room._resumeTimer = null;
   }
-  room.seats[seat] = ws;
-  ws._room = room;
+  const sockets = getSockets(room.id);
+  sockets[seat] = ws;
+  room.seatsOccupied = room.seatsOccupied || { A: false, B: false };
+  room.seatsOccupied[seat] = true;
+  ws._roomId = room.id;
   ws._seat = seat;
+  await saveRoom(room);
 }
 
 // 有人离座后启动保留计时:超时仍缺人才真正释放房间
+// 注意:这个计时器只存在于本进程内存中,不经过 Redis —— 如果服务器在计时
+// 期间重启,计时会丢失(房间元数据本身还在 Redis,只是不会自动过期清理,
+// 靠 ROOM_TTL_SEC 的 Redis 原生过期兜底)。
+const expiryTimers = new Map(); // roomId -> Timeout
+
 function armExpiry(room) {
-  if (room._resumeTimer) clearTimeout(room._resumeTimer);
-  room._resumeTimer = setTimeout(() => {
-    if (rooms.get(room.id) === room && (!room.seats.A || !room.seats.B)) {
-      const rest = room.seats.A || room.seats.B;
+  const existing = expiryTimers.get(room.id);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(async () => {
+    const current = await getRoom(room.id);
+    if (!current) return;
+    const sockets = getSockets(room.id);
+    if (!current.seatsOccupied.A || !current.seatsOccupied.B) {
+      const rest = sockets.A || sockets.B;
       if (rest) send(rest, 'room_expired', { roomId: room.id });
-      rooms.delete(room.id);
+      await deleteRoom(room.id);
+      expiryTimers.delete(room.id);
       console.log(`[room ${room.id}] expired (seat empty over ${RESUME_TIMEOUT_MS}ms)`);
     }
   }, RESUME_TIMEOUT_MS);
+  expiryTimers.set(room.id, timer);
 }
 
-function leaveSeat(ws) {
-  const room = ws._room;
-  if (!room) return;
-  if (room.seats[ws._seat] === ws) room.seats[ws._seat] = null;
-  ws._room = null;
+async function leaveSeat(ws) {
+  const roomId = ws._roomId;
+  if (!roomId) return null;
+  const room = await getRoom(roomId);
+  const sockets = getSockets(roomId);
+  if (sockets[ws._seat] === ws) sockets[ws._seat] = null;
+  if (room) {
+    room.seatsOccupied[ws._seat] = false;
+    await saveRoom(room);
+  }
+  ws._roomId = null;
   ws._seat = null;
+  return room;
 }
 
 const opponentSeat = (seat) => (seat === 'A' ? 'B' : 'A');
@@ -76,12 +134,12 @@ function send(ws, type, data = {}) {
   }
 }
 
-function broadcast(room, type, data = {}) {
-  for (const seat of ['A', 'B']) send(room.seats[seat], type, data);
+function broadcastToRoom(roomId, type, data = {}) {
+  const sockets = getSockets(roomId);
+  for (const seat of ['A', 'B']) send(sockets[seat], type, data);
 }
 
 function snapshot(room) {
-  // 局内元数据快照(用于断线重连 / sync)
   return {
     roomId: room.id,
     state: room.state,
@@ -89,10 +147,7 @@ function snapshot(room) {
     turnCount: room.turnCount,
     history: room.history,
     rematch: room.rematch,
-    seats: {
-      A: room.seats.A ? true : false,
-      B: room.seats.B ? true : false,
-    },
+    seats: { A: !!room.seatsOccupied.A, B: !!room.seatsOccupied.B },
   };
 }
 
@@ -110,31 +165,29 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
-  // 轻量 HTTP 接口:房间是否存在 / 房间列表(调试用)
   if (req.url === '/api/rooms') {
-    const list = [...rooms.values()].map((r) => ({
-      roomId: r.id,
-      state: r.state,
-      players: (r.seats.A ? 1 : 0) + (r.seats.B ? 1 : 0),
-      turn: r.turn,
-      turnCount: r.turnCount,
-    }));
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify(list));
-  }
-  // 可分享的访问地址(本机 + 局域网 IP),供网页客户端展示"发给对方的网址"
-  if (req.url === '/api/urls') {
-    const lan = [];
-    for (const list of Object.values(os.networkInterfaces())) {
-      for (const ni of list || []) {
-        if (ni.family === 'IPv4' && !ni.internal) lan.push(ni.address);
+    // 调试用:列出 Redis 里所有房间(scan 而非 keys,避免大量房间时阻塞)
+    (async () => {
+      const list = [];
+      for await (const key of redis.scanIterator({ MATCH: ROOM_KEY_PREFIX + '*' })) {
+        const raw = await redis.get(key);
+        if (!raw) continue;
+        const r = JSON.parse(raw);
+        list.push({
+          roomId: r.id,
+          state: r.state,
+          players: (r.seatsOccupied.A ? 1 : 0) + (r.seatsOccupied.B ? 1 : 0),
+          turn: r.turn,
+          turnCount: r.turnCount,
+        });
       }
-    }
-    // 虚拟网卡(VMware/VirtualBox)的地址几乎都以 .1 结尾且外部不可达,排到最后
-    const real = lan.filter((ip) => !ip.endsWith('.1'));
-    const urls = [`http://localhost:${PORT}`, ...(real.length ? real : lan).map((ip) => `http://${ip}:${PORT}`)];
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-    return res.end(JSON.stringify({ urls }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(list));
+    })().catch((err) => {
+      res.writeHead(500);
+      res.end(String(err));
+    });
+    return;
   }
   res.writeHead(404);
   res.end('not found');
@@ -146,7 +199,7 @@ const wss = new WebSocketServer({ server });
 wss.on('connection', (ws) => {
   ws.isAlive = true;
   ws.on('pong', () => (ws.isAlive = true));
-  ws.on('message', (raw) => {
+  ws.on('message', async (raw) => {
     let msg;
     try {
       msg = JSON.parse(raw.toString());
@@ -157,47 +210,47 @@ wss.on('connection', (ws) => {
       return send(ws, 'error', { code: 'BAD_TYPE', message: '缺少 type 字段' });
     }
     try {
-      handle(ws, msg);
+      await handle(ws, msg);
     } catch (err) {
       console.error('handle error:', err);
       send(ws, 'error', { code: 'INTERNAL', message: String(err.message || err) });
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', async () => {
     const qi = waitingQueue.indexOf(ws);
     if (qi !== -1) waitingQueue.splice(qi, 1);
-    const room = ws._room;
-    leaveSeat(ws);
+    const roomId = ws._roomId;
+    const room = await leaveSeat(ws);
     if (!room) return;
-    const other = room.seats.A || room.seats.B;
+    const sockets = getSockets(roomId);
+    const other = sockets.A || sockets.B;
     if (other) {
       send(other, 'opponent_left', { roomId: room.id });
-      // 对局挂起而非销毁,等待原座位重连(join_room 支持抢占空座位)
       if (room.state === 'playing') room.state = 'waiting';
-      room.rematch = { A: false, B: false }; // 有人走就清掉再来一局的请求,避免残留
-      armExpiry(room); // 限时保留,超时释放
+      room.rematch = { A: false, B: false };
+      await saveRoom(room);
+      armExpiry(room);
     } else {
-      rooms.delete(room.id); // 人都走光,回收房间
+      await deleteRoom(room.id);
     }
   });
 });
 
-// ----快速匹配:免去房间号传递,先等待者坐 A,后来者坐 B,即刻开局
+// ----快速匹配
 const waitingQueue = [];
 
-function handleQuickMatch(ws) {
-  if (ws._room) {
+async function handleQuickMatch(ws) {
+  if (ws._roomId) {
     return send(ws, 'error', { code: 'ALREADY_IN_ROOM', message: '已在房间中,请先 leave' });
   }
   if (waitingQueue.includes(ws)) {
-    return send(ws, 'match_waiting', {}); // 重复点击保持等待,幂等
+    return send(ws, 'match_waiting', {});
   }
-  // 取出最早仍在等待的玩家
   let partner = null;
   while (waitingQueue.length) {
     const cand = waitingQueue.shift();
-    if (cand.readyState === cand.OPEN && !cand._room) {
+    if (cand.readyState === cand.OPEN && !cand._roomId) {
       partner = cand;
       break;
     }
@@ -206,13 +259,23 @@ function handleQuickMatch(ws) {
     waitingQueue.push(ws);
     return send(ws, 'match_waiting', {});
   }
-  const room = { id: newRoomId(), seats: { A: null, B: null }, turn: null, turnCount: 0, history: [], state: 'waiting', rematch: { A: false, B: false }, firstMover: Math.random() < 0.5 ? 'A' : 'B', createdAt: Date.now() };
-  rooms.set(room.id, room);
-  joinSeat(room, partner, 'A');
-  joinSeat(room, ws, 'B');
+  const room = {
+    id: newRoomId(),
+    turn: null,
+    turnCount: 0,
+    history: [],
+    state: 'waiting',
+    rematch: { A: false, B: false },
+    firstMover: Math.random() < 0.5 ? 'A' : 'B',
+    seatsOccupied: { A: false, B: false },
+    createdAt: Date.now(),
+  };
+  await saveRoom(room);
+  await joinSeat(room, partner, 'A');
+  await joinSeat(room, ws, 'B');
   send(partner, 'match_found', { roomId: room.id, yourSeat: 'A' });
   send(ws, 'match_found', { roomId: room.id, yourSeat: 'B' });
-  startNewGame(room); // 首局先手随机,此后每局轮换
+  await startNewGame(room);
   console.log(`[room ${room.id}] quick match: A+B paired`);
 }
 
@@ -222,7 +285,7 @@ function handleCancelMatch(ws) {
   send(ws, 'match_cancelled', {});
 }
 
-function handle(ws, msg) {
+async function handle(ws, msg) {
   switch (msg.type) {
     case 'quick_match':
       return handleQuickMatch(ws);
@@ -249,67 +312,82 @@ function handle(ws, msg) {
   }
 }
 
-// ----建房:自动落座 A,等待对手
-function handleCreate(ws) {
-  if (ws._room) {
+async function handleCreate(ws) {
+  if (ws._roomId) {
     return send(ws, 'error', { code: 'ALREADY_IN_ROOM', message: '已在房间中,请先 leave' });
   }
-  const room = { id: newRoomId(), seats: { A: null, B: null }, turn: null, turnCount: 0, history: [], state: 'waiting', rematch: { A: false, B: false }, firstMover: 'A', createdAt: Date.now() };
-  rooms.set(room.id, room);
-  joinSeat(room, ws, 'A');
+  const room = {
+    id: newRoomId(),
+    turn: null,
+    turnCount: 0,
+    history: [],
+    state: 'waiting',
+    rematch: { A: false, B: false },
+    firstMover: 'A',
+    seatsOccupied: { A: false, B: false },
+    createdAt: Date.now(),
+  };
+  await saveRoom(room);
+  await joinSeat(room, ws, 'A');
   send(ws, 'room_created', { roomId: room.id, yourSeat: 'A' });
   console.log(`[room ${room.id}] created by seat A`);
 }
 
-// ----加入:抢占空座位;A 先手,双方到齐即开局
-function handleJoin(ws, msg) {
-  if (ws._room) {
+async function handleJoin(ws, msg) {
+  if (ws._roomId) {
     return send(ws, 'error', { code: 'ALREADY_IN_ROOM', message: '已在房间中,请先 leave' });
   }
-  const room = rooms.get(String(msg.roomId || '').toUpperCase());
+  const room = await getRoom(String(msg.roomId || '').toUpperCase());
   if (!room) return send(ws, 'error', { code: 'ROOM_NOT_FOUND', message: '房间不存在' });
 
-  // 断线重连优先坐回原座位(避免与对手换边)
   const prefer = msg.preferSeat === 'A' || msg.preferSeat === 'B' ? msg.preferSeat : null;
-  const freeSeat = prefer && !room.seats[prefer] ? prefer : room.seats.A ? (room.seats.B ? null : 'B') : 'A';
+  const freeSeat =
+    prefer && !room.seatsOccupied[prefer] ? prefer : room.seatsOccupied.A ? (room.seatsOccupied.B ? null : 'B') : 'A';
   if (!freeSeat) return send(ws, 'error', { code: 'ROOM_FULL', message: '房间已满' });
 
-  joinSeat(room, ws, freeSeat);
+  await joinSeat(room, ws, freeSeat);
   send(ws, 'room_joined', { roomId: room.id, yourSeat: freeSeat });
 
-  const both = room.seats.A && room.seats.B;
+  const both = room.seatsOccupied.A && room.seatsOccupied.B;
   if (both && room.state !== 'over') {
     room.rematch = { A: false, B: false };
     if (room.turnCount > 0) {
-      // 中断过的对局:保留棋盘、历史与行棋权,双方恢复继续下
       room.state = 'playing';
-      broadcast(room, 'game_resumed', { roomId: room.id, turn: room.turn, turnCount: room.turnCount, history: room.history });
+      await saveRoom(room);
+      broadcastToRoom(room.id, 'game_resumed', {
+        roomId: room.id,
+        turn: room.turn,
+        turnCount: room.turnCount,
+        history: room.history,
+      });
       console.log(`[room ${room.id}] game resumed at move ${room.turnCount}, turn=${room.turn}`);
     } else {
-      // 一手未下:正常重开(先手按房间轮换记录)
-      startNewGame(room);
+      await startNewGame(room);
     }
   } else {
     send(ws, 'sync_state', { room: snapshot(room) });
   }
 }
 
-// ----开新局:按房间记录的先手方开局,并轮换(这把 A 先则下把 B 先,先后手交替)
-function startNewGame(room) {
+async function startNewGame(room) {
   room.turn = room.firstMover;
   room.turnCount = 0;
   room.history = [];
   room.rematch = { A: false, B: false };
   room.state = 'playing';
-  broadcast(room, 'game_start', { roomId: room.id, firstTurn: room.firstMover });
+  const nextFirstMover = opponentSeat(room.firstMover);
+  await saveRoom(room);
+  broadcastToRoom(room.id, 'game_start', { roomId: room.id, firstTurn: room.firstMover });
   console.log(`[room ${room.id}] game start, first mover = ${room.firstMover}`);
-  room.firstMover = opponentSeat(room.firstMover); // 下一局换先
+  room.firstMover = nextFirstMover;
+  await saveRoom(room);
 }
 
-// ----落子:唯一由服务端强校验的通道,保证回合不错乱
-function handleMove(ws, msg) {
-  const room = ws._room;
-  if (!room) return send(ws, 'error', { code: 'NOT_IN_ROOM', message: '尚未加入房间' });
+async function handleMove(ws, msg) {
+  const roomId = ws._roomId;
+  if (!roomId) return send(ws, 'error', { code: 'NOT_IN_ROOM', message: '尚未加入房间' });
+  const room = await getRoom(roomId);
+  if (!room) return send(ws, 'error', { code: 'ROOM_NOT_FOUND', message: '房间不存在' });
   if (room.state !== 'playing') {
     return send(ws, 'error', { code: 'NOT_PLAYING', message: `当前房间状态为 ${room.state},不能落子` });
   }
@@ -324,75 +402,87 @@ function handleMove(ws, msg) {
   room.history.push(record);
   room.turnCount += 1;
   room.turn = opponentSeat(room.turn);
-  broadcast(room, 'move_made', {
+  await saveRoom(room);
+  broadcastToRoom(room.id, 'move_made', {
     roomId: room.id,
     seat: record.seat,
-    payload: record.payload, // 原样透传,服务端不理解内容
+    payload: record.payload,
     turnCount: record.turnCount,
     nextTurn: room.turn,
   });
 }
 
-// ----透传:任意业务数据原样转发给对方,服务端零解析
 function handleRelay(ws, msg) {
-  const room = ws._room;
-  if (!room) return send(ws, 'error', { code: 'NOT_IN_ROOM', message: '尚未加入房间' });
-  const to = room.seats[opponentSeat(ws._seat)];
+  const roomId = ws._roomId;
+  if (!roomId) return send(ws, 'error', { code: 'NOT_IN_ROOM', message: '尚未加入房间' });
+  const sockets = getSockets(roomId);
+  const to = sockets[opponentSeat(ws._seat)];
   if (!to) return send(ws, 'error', { code: 'OPPONENT_OFFLINE', message: '对方不在线' });
-  send(to, 'relay', { roomId: room.id, from: ws._seat, payload: msg.payload });
+  send(to, 'relay', { roomId, from: ws._seat, payload: msg.payload });
 }
 
-// ----终局:由客户端判定胜负后上报,服务端只记账并广播
-function handleGameOver(ws, msg) {
-  const room = ws._room;
-  if (!room) return send(ws, 'error', { code: 'NOT_IN_ROOM', message: '尚未加入房间' });
-  if (room.state === 'over') return; // 双方客户端可能都判胜并各上报一次,去重只广播一次
+async function handleGameOver(ws, msg) {
+  const roomId = ws._roomId;
+  if (!roomId) return send(ws, 'error', { code: 'NOT_IN_ROOM', message: '尚未加入房间' });
+  const room = await getRoom(roomId);
+  if (!room) return send(ws, 'error', { code: 'ROOM_NOT_FOUND', message: '房间不存在' });
+  if (room.state === 'over') return;
   room.state = 'over';
   room.rematch = { A: false, B: false };
-  broadcast(room, 'game_over', {
+  await saveRoom(room);
+  broadcastToRoom(room.id, 'game_over', {
     roomId: room.id,
     winner: msg.winner ?? null,
     reason: msg.reason ?? 'client_declared',
-    payload: msg.payload, // 终局附加数据原样透传
+    payload: msg.payload,
   });
   console.log(`[room ${room.id}] game over, winner=${msg.winner ?? '-'}`);
 }
 
-// ----再来一局:终局后任意一方请求,双方都请求则原地重开(同房间同对手)
-function handleRematch(ws) {
-  const room = ws._room;
-  if (!room) return send(ws, 'error', { code: 'NOT_IN_ROOM', message: '尚未加入房间' });
+async function handleRematch(ws) {
+  const roomId = ws._roomId;
+  if (!roomId) return send(ws, 'error', { code: 'NOT_IN_ROOM', message: '尚未加入房间' });
+  const room = await getRoom(roomId);
+  if (!room) return send(ws, 'error', { code: 'ROOM_NOT_FOUND', message: '房间不存在' });
   if (room.state !== 'over') {
     return send(ws, 'error', { code: 'NOT_OVER', message: '对局尚未结束,不能请求再来一局' });
   }
   room.rematch[ws._seat] = true;
-  broadcast(room, 'rematch_state', { roomId: room.id, requested: ['A', 'B'].filter((s) => room.rematch[s]) });
+  await saveRoom(room);
+  broadcastToRoom(room.id, 'rematch_state', {
+    roomId: room.id,
+    requested: ['A', 'B'].filter((s) => room.rematch[s]),
+  });
   if (room.rematch.A && room.rematch.B) {
-    startNewGame(room);
+    await startNewGame(room);
     console.log(`[room ${room.id}] rematch accepted, game restarts`);
   }
 }
 
-// ----状态同步:断线重连后拉取快照
-function handleSync(ws) {
-  const room = ws._room;
-  if (!room) return send(ws, 'error', { code: 'NOT_IN_ROOM', message: '尚未加入房间' });
+async function handleSync(ws) {
+  const roomId = ws._roomId;
+  if (!roomId) return send(ws, 'error', { code: 'NOT_IN_ROOM', message: '尚未加入房间' });
+  const room = await getRoom(roomId);
+  if (!room) return send(ws, 'error', { code: 'ROOM_NOT_FOUND', message: '房间不存在' });
   send(ws, 'sync_state', { room: snapshot(room) });
 }
 
-// ----主动离席
-function handleLeave(ws) {
-  const room = ws._room;
+async function handleLeave(ws) {
+  const roomId = ws._roomId;
+  if (!roomId) return;
+  const room = await leaveSeat(ws);
   if (!room) return;
-  leaveSeat(ws);
   room.rematch = { A: false, B: false };
+  await saveRoom(room);
   send(ws, 'left', { roomId: room.id });
-  const other = room.seats.A || room.seats.B;
+  const sockets = getSockets(roomId);
+  const other = sockets.A || sockets.B;
   if (other) {
     send(other, 'opponent_left', { roomId: room.id });
-    armExpiry(room); // 主动离席同样限时保留,给反悔/误触留余地
+    armExpiry(room);
+  } else {
+    await deleteRoom(room.id);
   }
-  else rooms.delete(room.id);
 }
 
 // ---------------- 心跳清理 ----------------
@@ -407,9 +497,14 @@ setInterval(() => {
   }
 }, 30000);
 
-server.listen(PORT, () => {
-  console.log(`对弈服务器已启动:`);
-  console.log(`  网页客户端  http://localhost:${PORT}`);
-  console.log(`  WebSocket   ws://localhost:${PORT}`);
-  console.log(`  房间调试    http://localhost:${PORT}/api/rooms`);
-});
+// ---------------- 启动 ----------------
+(async () => {
+  await redis.connect();
+  console.log(`[redis] connected: ${REDIS_URL}`);
+  server.listen(PORT, () => {
+    console.log(`对弈服务器已启动(Redis 版):`);
+    console.log(`  网页客户端  http://localhost:${PORT}`);
+    console.log(`  WebSocket   ws://localhost:${PORT}`);
+    console.log(`  房间调试    http://localhost:${PORT}/api/rooms`);
+  });
+})();

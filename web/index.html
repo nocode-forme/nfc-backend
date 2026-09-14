@@ -29,9 +29,6 @@
   canvas.mine { box-shadow: 0 0 0 3px #2f6f4f66; }
   .side { width: 300px; display: flex; flex-direction: column; gap: 12px; }
   .side h2 { font-size: 14px; color: #555; border-bottom: 1px solid #eee; padding-bottom: 4px; }
-  #invite { background: #eef6f0; border: 1px dashed #2f6f4f; border-radius: 6px; padding: 8px; margin-bottom: 8px; font-size: 13px; }
-  #invite code { background: #fff; padding: 2px 6px; border-radius: 4px; border: 1px solid #ccc; user-select: all; }
-  #invite button { font-size: 12px; padding: 2px 8px; }
   #log { height: 120px; overflow-y: auto; font-size: 12px; font-family: Consolas, monospace; background: #fafafa; border: 1px solid #eee; border-radius: 6px; padding: 6px; }
   #log div { padding: 1px 0; border-bottom: 1px dashed #f0f0f0; }
   #msgbox { width: 100%; }
@@ -66,7 +63,6 @@
         <button id="btnUndo" class="ghost" style="display:none">↩ 悔棋</button>
       </div>
       <div id="status"><span class="bad">未连接</span></div>
-      <div id="invite" style="display:none"></div>
       <canvas id="board" width="540" height="540"></canvas>
       <div class="hint" style="margin-top:6px">
         我方 <span id="mySeat">-</span> · 对手 <span id="oppNick">-</span> · 当前行棋 <span id="turnDot" class="none"></span><span id="curTurn">-</span> · 第 <span id="turnCount">0</span> 手
@@ -84,7 +80,7 @@
           <label>服务器 <input id="serverUrl" size="22" /></label>
           <button id="btnConnect" class="ghost">重连</button>
         </div>
-        <div class="hint">跨电脑:同一局域网直接用上方网址;跨网络可用内网穿透(如 cloudflared/ngrok)后填公网地址。人机对局不需要服务器。</div>
+        <div class="hint">把上方服务器地址发给对方(微信/任意方式),对方打开后同样点「快速匹配」即可自动配对。人机对局不需要服务器。</div>
       </details>
     </div>
 
@@ -171,7 +167,6 @@ function recordResult(result) {
   });
   startTime = null;
 }
-// 本局没正式结束就被放弃(主动离席/房间超时释放)
 function recordAbandonIfAny() {
   if (recordedThisGame || !mySeat || currentMoves() === 0) return;
   recordedThisGame = true;
@@ -262,8 +257,8 @@ canvas.addEventListener('click', (e) => {
   const x = Math.round((e.clientX - rect.left - PAD) / CELL);
   const y = Math.round((e.clientY - rect.top - PAD) / CELL);
   if (x < 0 || x >= N || y < 0 || y >= N || board[y][x]) return;
-  if (aiMode) applyMove(mySeat, x, y); // 人机:本地直接落子
-  else sendMsg('move', { payload: { x, y } }); // 真人:走服务器回合管制
+  if (aiMode) applyMove(mySeat, x, y);
+  else sendMsg('move', { payload: { x, y } });
 });
 
 /* ================= 本地胜负判定(客户端自治,服务器不参与) ================= */
@@ -324,18 +319,15 @@ function connect() {
     matching = false; pendingQuickMatch = false;
     setBtns();
     if (!aiMode) { resetBoard(); draw(); updateHud(); }
-    // 有未完成的对局:自动回座续弈(join_room 带 preferSeat 坐回原位)
     const s = loadSession();
     if (s && !mySeat) {
       setStatus('检测到未完成的对局,正在回到座位…', 'wait');
       sendMsg('join_room', { roomId: s.roomId, preferSeat: s.seat });
     } else if (!aiMode) {
       setStatus('已连接,点击「快速匹配」找真人,或「人机对局」离线玩', 'ok');
-      loadInviteUrls();
     }
   };
   ws.onclose = () => {
-    // 人机对局不依赖服务器,连接断了照常下
     if (aiMode) {
       setBtns();
       setStatus(playing ? '⚠️ 服务器连接断开(人机对局不受影响)' : '已离线 · 人机对局可随时开始', playing ? 'wait' : 'ok');
@@ -344,7 +336,6 @@ function connect() {
     playing = false; matching = false; pendingQuickMatch = false;
     mySeat = null; roomId = null; curTurn = null; opponentOnline = false;
     updateHud(); draw(); setBtns();
-    // 断线重连:只要还有保留中的会话,自动尝试恢复(最多 10 次,约 30 秒)
     if (loadSession() && reconnectTries < 10) {
       reconnectTries++;
       setStatus(`连接中断,自动重连中(第 ${reconnectTries}/10 次)…人机对局不受影响`, 'bad');
@@ -360,26 +351,8 @@ function connect() {
   };
 }
 
-// 从服务器拉可分享网址,直接展示给对方
-async function loadInviteUrls() {
-  const wsUrl = $('serverUrl').value.trim();
-  const base = wsUrl.replace(/^ws(s?):\/\//, 'http$1://');
-  let url = base;
-  try {
-    const res = await fetch(`${base}/api/urls`);
-    const { urls } = await res.json();
-    if (urls && urls.length) url = urls.find((u) => !u.includes('localhost')) || urls[0];
-  } catch { /* 服务器无此接口时兜底用 base */ }
-  if (mySeat) return;
-  const box = $('invite');
-  box.innerHTML = `📱 把这个网址发给对方(微信/任意方式),对方打开后同样点「快速匹配」即可自动配对:<br>
-    <code>${esc(url)}</code> <button class="ghost" onclick="navigator.clipboard.writeText('${esc(url)}');this.textContent='已复制'">复制</button>`;
-  box.style.display = '';
-}
-
 function clearRematchFlags() { rematchByMe = false; rematchByOpponent = false; }
 
-// 服务器身份的对局开始时,若正在人机对局则先正确收尾(记中断、退出人机模式)
 function leaveAiIfNeeded() {
   if (!aiMode) return;
   recordAbandonIfAny();
@@ -387,10 +360,10 @@ function leaveAiIfNeeded() {
 }
 
 /* ================= 人机对局(纯客户端,服务器零参与) ================= */
-let aiMode = false;        // 是否处于人机对局
-let aiSeat = null;         // 电脑执哪方 'A'|'B'
-let aiTimer = null;        // 电脑落子延时
-let aiPlayerBlack = true;  // 玩家是否执黑(再来一局自动换边)
+let aiMode = false;
+let aiSeat = null;
+let aiTimer = null;
+let aiPlayerBlack = true;
 
 function cancelAiTimer() { if (aiTimer) { clearTimeout(aiTimer); aiTimer = null; } }
 function exitAIMode() { cancelAiTimer(); aiMode = false; aiSeat = null; aiMoveStack = []; }
@@ -403,10 +376,9 @@ function startAIGame(playerBlack) {
   mySeat = playerBlack ? 'A' : 'B';
   roomId = null;
   resetBoard(); playing = true; curTurn = 'A';
-  blackSeat = 'A'; // 人机局 A 恒为先手(玩家执黑时)
+  blackSeat = 'A';
   opponentOnline = true; opponentGone = false; opponentNick = '电脑';
   startTime = Date.now(); recordedThisGame = false;
-  $('invite').style.display = 'none';
   setStatus(playerBlack ? '🤖 人机对局开始,你执黑先行' : '🤖 人机对局开始,电脑执黑先行…', 'ok');
   log('SYS', `人机对局开始:你执${playerBlack ? '黑(先手)' : '白(后手)'},电脑${playerBlack ? '执白' : '执黑'}`);
   updateHud(); draw(); setBtns();
@@ -425,15 +397,14 @@ function aiMoveNow() {
   applyMove(aiSeat, mv.x, mv.y);
 }
 
-/* ---------- AI 启发式:对每个空点算「我下这的攻击分 + 对方下这的防守分×0.88」 ---------- */
-const AI_SLEEPY = 0.35; // 难度旋钮:每手棋"打盹"概率——看不见对方四以下威胁(活三等)。调大更弱,0=全力以赴
-let aiMoveStack = [];   // 人机局落子栈,悔棋用
+const AI_SLEEPY = 0.35;
+let aiMoveStack = [];
 
 function patternScore(cnt, open) {
-  if (cnt >= 5) return 10000000;      // 连五
-  if (open === 0) return 0;           // 两头皆堵,废点
-  if (cnt === 4) return open === 2 ? 500000 : 120000; // 活四 / 冲四
-  if (cnt === 3) return open === 2 ? 45000 : 800;     // 活三 / 眠三
+  if (cnt >= 5) return 10000000;
+  if (open === 0) return 0;
+  if (cnt === 4) return open === 2 ? 500000 : 120000;
+  if (cnt === 3) return open === 2 ? 45000 : 800;
   if (cnt === 2) return open === 2 ? 250 : 30;
   return open === 2 ? 15 : 3;
 }
@@ -462,9 +433,7 @@ function cellScore(x, y, c) {
 }
 function pickAiMove() {
   const me = aiSeat, you = me === 'A' ? 'B' : 'A';
-  if (currentMoves() === 0) return { x: 7, y: 7 }; // 空盘先占天元
-  // 难度:每手棋有 AI_SLEEPY 概率"打盹"——无视对方冲四以下的威胁(活三/眠三等),
-  // 只对冲四/连五保持警惕。这让普通玩家有机会靠布局赢,但 AI 不会蠢到白送五连
+  if (currentMoves() === 0) return { x: 7, y: 7 };
   const sleepy = Math.random() < AI_SLEEPY;
   let best = null, bestScore = -1;
   for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
@@ -475,27 +444,24 @@ function pickAiMove() {
       const nx = x + dx, ny = y + dy;
       if (nx >= 0 && nx < N && ny >= 0 && ny < N && board[ny][nx]) { near = true; break outer; }
     }
-    if (!near) continue; // 只考虑已有棋子附近的点
+    if (!near) continue;
     const atk = cellScore(x, y, me);
     let def = cellScore(x, y, you);
-    if (sleepy && def < 1000000) def = 0; // 打盹:只对"对方再一手就成五"保持警惕,活三/冲四级布局常会漏防
-    // 攻击分 + 防守分×0.88(能自己连五绝不只顾堵)+ 随机扰动让着法不那么死板
+    if (sleepy && def < 1000000) def = 0;
     const s = atk + def * 0.88 + Math.random() * 20;
     if (s > bestScore) { bestScore = s; best = { x, y }; }
-    if (bestScore >= 10000000) return best; // 找到制胜点立即出手
+    if (bestScore >= 10000000) return best;
   }
   return best;
 }
 
-// 人机局落子入栈(applyMove 调用;真人对局为空操作)
 function pushAiMove(x, y) { if (aiMode) aiMoveStack.push({ x, y }); }
 
-// 悔棋(仅人机):电脑思考中 → 只撤你刚下那手;轮到你 → 撤一整回合(电脑+你各一手)
 function aiUndo() {
   if (!aiMode || !playing) return;
   const n = curTurn === aiSeat ? 1 : 2;
-  if (aiMoveStack.length < n) return; // 无可悔(如你执白且只有电脑的开局手)
-  cancelAiTimer(); // 电脑若正要落子,一并作废
+  if (aiMoveStack.length < n) return;
+  cancelAiTimer();
   for (let k = 0; k < n && aiMoveStack.length; k++) {
     const mv = aiMoveStack.pop();
     board[mv.y][mv.x] = null;
@@ -508,7 +474,7 @@ function aiUndo() {
   updateHud(); draw(); setBtns();
 }
 
-/* ================= 落子统一入口(人机本地 / 真人服务器消息共用) ================= */
+/* ================= 落子统一入口 ================= */
 function applyMove(seat, x, y, turnCount) {
   board[y][x] = seat;
   pushAiMove(x, y);
@@ -563,7 +529,6 @@ function handleServer(m) {
       leaveAiIfNeeded();
       matching = false;
       roomId = m.roomId; mySeat = m.yourSeat;
-      $('invite').style.display = 'none';
       saveSession();
       log('SYS', `匹配成功!房间 ${m.roomId},你的座位 ${mySeat}(${mySeat === 'A' ? '黑/先手' : '白/后手'})`);
       break;
@@ -571,7 +536,6 @@ function handleServer(m) {
     case 'room_created':
       leaveAiIfNeeded();
       roomId = m.roomId; mySeat = m.yourSeat;
-      $('invite').style.display = 'none';
       saveSession();
       setStatus(`房间 ${roomId} 已创建,等待对方加入(你是 A,先手)`, 'ok');
       log('SYS', `房间 ${roomId} 创建成功,你的座位 A`);
@@ -587,7 +551,7 @@ function handleServer(m) {
     case 'game_start':
       leaveAiIfNeeded();
       resetBoard(); playing = true; curTurn = m.firstTurn;
-      blackSeat = m.firstTurn; // 服务器轮换先手,按本局实际先手记黑
+      blackSeat = m.firstTurn;
       clearRematchFlags(); opponentOnline = true; opponentGone = false; opponentNick = null;
       startTime = Date.now(); recordedThisGame = false;
       setStatus(curTurn === mySeat ? '⚫ 对局开始,轮到你落子' : '⚪ 对局开始,对方先手,等待…', 'ok');
@@ -599,7 +563,7 @@ function handleServer(m) {
       leaveAiIfNeeded();
       rebuildFromHistory(m.history);
       playing = true; curTurn = m.turn;
-      blackSeat = (m.history && m.history.length) ? m.history[0].seat : m.turn; // 第一手即先手方
+      blackSeat = (m.history && m.history.length) ? m.history[0].seat : m.turn;
       clearRematchFlags(); opponentOnline = true; opponentGone = false;
       if (!startTime) startTime = Date.now();
       setStatus(`🔄 对局已恢复(共 ${m.turnCount} 手)——${curTurn === mySeat ? '轮到你落子' : '等待对方落子'}`, 'ok');
@@ -608,7 +572,7 @@ function handleServer(m) {
       break;
 
     case 'move_made':
-      if (aiMode) break; // 人机模式下不该收到服务器落子,忽略
+      if (aiMode) break;
       applyMove(m.seat, m.payload.x, m.payload.y, m.turnCount);
       break;
 
@@ -652,7 +616,6 @@ function handleServer(m) {
     }
 
     case 'opponent_left':
-      // 棋局保留:不记中断战绩,等对方重连自动恢复
       opponentOnline = false; opponentGone = true;
       playing = false;
       clearRematchFlags();
@@ -661,7 +624,6 @@ function handleServer(m) {
       break;
 
     case 'room_expired':
-      // 保留超时,房间已被服务器释放
       recordAbandonIfAny();
       roomId = null; mySeat = null; playing = false;
       clearRematchFlags(); opponentOnline = false; opponentGone = false;
@@ -669,11 +631,10 @@ function handleServer(m) {
       resetBoard(); draw();
       setStatus('保留的对局已超时释放(记为中断)。点「快速匹配」开始新对局', 'ok');
       log('SYS', '房间保留超时,已释放');
-      loadInviteUrls();
       break;
 
     case 'left':
-      recordAbandonIfAny(); // 主动离席 = 放弃未完成的对局
+      recordAbandonIfAny();
       roomId = null; mySeat = null; playing = false;
       clearRematchFlags(); opponentOnline = false; opponentGone = false;
       clearSession();
@@ -686,7 +647,6 @@ function handleServer(m) {
       }
       resetBoard(); draw();
       setStatus('已离席', 'ok');
-      loadInviteUrls();
       break;
 
     case 'error':
@@ -695,7 +655,6 @@ function handleServer(m) {
       if ((m.code === 'ROOM_NOT_FOUND' || m.code === 'ROOM_FULL') && loadSession()) {
         clearSession();
         setStatus('之前保留的对局已不在(可能超时释放)。点「快速匹配」开始新对局', 'ok');
-        loadInviteUrls();
       }
       break;
   }
@@ -721,17 +680,17 @@ function setBtns() {
     $('btnSend').disabled = !connected;
     return;
   }
-  const over = connected && mySeat && !playing && !opponentGone; // 终局状态
+  const over = connected && mySeat && !playing && !opponentGone;
   $('btnMatch').disabled = !connected || matching || (!!mySeat && !over && !opponentGone);
   $('btnMatch').textContent = over || opponentGone ? '⚡ 换对手匹配' : (mySeat ? '已在对局中' : (matching ? '匹配中…' : '⚡ 快速匹配'));
-  $('btnAI').disabled = (!!mySeat && !over && !opponentGone) || matching; // 真人对局进行中不给人机入口
+  $('btnAI').disabled = (!!mySeat && !over && !opponentGone) || matching;
   $('btnAI').textContent = '🤖 人机对局';
   $('btnRematch').style.display = over ? '' : 'none';
   $('btnRematch').disabled = over && !opponentOnline;
   $('btnRematch').textContent = rematchByOpponent && !rematchByMe ? '✅ 接受再来一局' : (rematchByMe ? '等待对方…' : '🔁 再来一局');
   $('btnCancelMatch').style.display = matching ? '' : 'none';
   $('btnResign').style.display = playing && mySeat ? '' : 'none';
-  $('btnUndo').style.display = 'none'; // 悔棋仅人机对局提供
+  $('btnUndo').style.display = 'none';
   $('btnCreate').disabled = !connected || !!mySeat;
   $('btnJoin').disabled = !connected || !!mySeat;
   $('btnLeave').disabled = !connected || !mySeat;
@@ -747,28 +706,26 @@ $('btnMatch').onclick = () => {
     else setStatus('未连接服务器:请先展开「高级 → 重连」,或直接点「人机对局」', 'bad');
     return;
   }
-  if (mySeat && !playing) { pendingQuickMatch = true; sendMsg('leave'); } // 终局/对方掉线:先离席再自动匹配
+  if (mySeat && !playing) { pendingQuickMatch = true; sendMsg('leave'); }
   else sendMsg('quick_match');
 };
 $('btnAI').onclick = () => {
   if (aiMode) {
-    // 人机局中重开 / 结束后再来一局(换边)
     if (playing && !confirm('当前人机对局尚未结束,重开将记为中断,确定?')) return;
     recordAbandonIfAny();
-    startAIGame(!aiPlayerBlack); // 重开自动换边,先后手体验都试
+    startAIGame(!aiPlayerBlack);
     return;
   }
   if (mySeat) {
-    // 在服务器房间里(对局中或已终局):先离席,收到 left 后自动开人机局
     if (playing && !confirm('当前有未完成的对人局,离开将记为中断,确定?')) return;
     pendingAIStart = true;
     sendMsg('leave');
     return;
   }
-  startAIGame(true); // 全新开始:玩家执黑先行
+  startAIGame(true);
 };
 $('btnRematch').onclick = () => {
-  if (aiMode) { startAIGame(!aiPlayerBlack); return; } // 人机:换边再来
+  if (aiMode) { startAIGame(!aiPlayerBlack); return; }
   rematchByMe = true; sendMsg('rematch'); setBtns();
 };
 $('btnCancelMatch').onclick = () => sendMsg('cancel_match');
@@ -786,7 +743,6 @@ $('btnLeave').onclick = () => {
     resetBoard(); draw();
     setStatus('已退出人机对局', 'ok');
     updateHud(); setBtns();
-    if (ws && ws.readyState === 1) loadInviteUrls();
     return;
   }
   sendMsg('leave');
