@@ -153,7 +153,19 @@ function snapshot(room) {
 
 // ---------------- HTTP:托管网页客户端 ----------------
 const server = http.createServer((req, res) => {
-  if (req.url === '/' || req.url === '/index.html') {
+  if (req.url === '/' || req.url === '/landing.html') {
+    const file = path.join(__dirname, 'web', 'landing.html');
+    fs.readFile(file, (err, buf) => {
+      if (err) {
+        res.writeHead(500);
+        return res.end('landing page missing');
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(buf);
+    });
+    return;
+  }
+  if (req.url === '/demo' || req.url === '/index.html') {
     const file = path.join(__dirname, 'web', 'index.html');
     fs.readFile(file, (err, buf) => {
       if (err) {
