@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>摄像头校准</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #f4f1ea;
+    color: #333;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .topbar { padding: 16px; }
+  .back {
+    display: inline-block;
+    font-size: 14px;
+    color: #2f6f4f;
+    text-decoration: none;
+  }
+  .back:hover { text-decoration: underline; }
+
+  /* 主体区域占满剩余高度,内容在水平和垂直方向都居中 */
+  .content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 28px;
+    padding: 24px;
+    text-align: center;
+  }
+
+  .prompt {
+    font-size: 17px;
+    line-height: 1.6;
+    color: #333;
+    max-width: 420px;
+  }
+
+  #btnContinue {
+    font-size: 16px;
+    padding: 12px 32px;
+    border-radius: 8px;
+    border: none;
+    background: #2f6f4f;
+    color: #fff;
+    cursor: pointer;
+  }
+  #btnContinue:hover { background: #275c41; }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <a class="back" href="/">&lt; 返回</a>
+  </div>
+
+  <div class="content">
+    <p class="prompt">请将棋盘放置在摄像头下方的塑料定位板上</p>
+    <button id="btnContinue">继续</button>
+  </div>
+
+<script>
+  // 从 landing.html 带过来的模式(pvp / ai),校准完成后用来决定去哪个模式——
+  // 目前真人对战 / 人机对战本身还没有实机对局页面,先原样保留这个参数,
+  // 等对应模式做好了再把下面的占位逻辑换成真正跳转。
+  const mode = new URLSearchParams(location.search).get('mode');
+
+  document.getElementById('btnContinue').onclick = () => {
+    // 占位:校准本身不需要任何前置条件,随时可以点。
+    // TODO: 校准完成后接入实际的取图逻辑,再跳到对应模式的对局页面。
+    alert('校准完成(占位)。' + (mode ? `模式:${mode === 'ai' ? '人机对战' : '真人对战'} —— 对局页面开发中。` : ''));
+  };
+</script>
+</body>
+</html>

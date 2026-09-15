@@ -183,6 +183,10 @@ const server = http.createServer((req, res) => {
   if (req.url === '/demo' || req.url === '/index.html') {
     return serveFile(res, 'index.html', 'client file missing');
   }
+  if (req.url.startsWith('/calibration.html')) {
+    // startsWith 而非精确匹配:calibration.html 会带 ?mode=pvp/ai 查询参数
+    return serveFile(res, 'calibration.html', 'calibration page missing');
+  }
   if (req.url === '/api/rooms') {
     // 调试用:列出 Redis 里所有房间(scan 而非 keys,避免大量房间时阻塞)
     (async () => {
