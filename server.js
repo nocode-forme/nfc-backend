@@ -67,6 +67,17 @@ async function deleteRoom(roomId) {
   socketsByRoom.delete(roomId);
 }
 
+// 统一 get → 交给回调修改 → save 的流程,省去每个 handler 里重复的
+// await getRoom / await saveRoom 配对(也避免漏 save 的低级错误)。
+// fn 返回 false 时视为"提前中止、不落盘"(例如校验失败提前 return 的场景)。
+async function withRoom(roomId, fn) {
+  const room = await getRoom(roomId);
+  if (!room) return null;
+  const result = await fn(room);
+  if (result !== false) await saveRoom(room);
+  return room;
+}
+
 function getSockets(roomId) {
   if (!socketsByRoom.has(roomId)) socketsByRoom.set(roomId, { A: null, B: null });
   return socketsByRoom.get(roomId);
@@ -152,30 +163,25 @@ function snapshot(room) {
 }
 
 // ---------------- HTTP:托管网页客户端 ----------------
+// 统一的静态文件返回逻辑,避免每个路由重复一遍 readFile + 错误处理 + 响应头
+function serveFile(res, relPath, errMsg) {
+  const file = path.join(__dirname, 'web', relPath);
+  fs.readFile(file, (err, buf) => {
+    if (err) {
+      res.writeHead(500);
+      return res.end(errMsg);
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(buf);
+  });
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === '/' || req.url === '/landing.html') {
-    const file = path.join(__dirname, 'web', 'landing.html');
-    fs.readFile(file, (err, buf) => {
-      if (err) {
-        res.writeHead(500);
-        return res.end('landing page missing');
-      }
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-      res.end(buf);
-    });
-    return;
+    return serveFile(res, 'landing.html', 'landing page missing');
   }
   if (req.url === '/demo' || req.url === '/index.html') {
-    const file = path.join(__dirname, 'web', 'index.html');
-    fs.readFile(file, (err, buf) => {
-      if (err) {
-        res.writeHead(500);
-        return res.end('client file missing');
-      }
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-      res.end(buf);
-    });
-    return;
+    return serveFile(res, 'index.html', 'client file missing');
   }
   if (req.url === '/api/rooms') {
     // 调试用:列出 Redis 里所有房间(scan 而非 keys,避免大量房间时阻塞)
@@ -398,23 +404,29 @@ async function startNewGame(room) {
 async function handleMove(ws, msg) {
   const roomId = ws._roomId;
   if (!roomId) return send(ws, 'error', { code: 'NOT_IN_ROOM', message: '尚未加入房间' });
-  const room = await getRoom(roomId);
-  if (!room) return send(ws, 'error', { code: 'ROOM_NOT_FOUND', message: '房间不存在' });
-  if (room.state !== 'playing') {
-    return send(ws, 'error', { code: 'NOT_PLAYING', message: `当前房间状态为 ${room.state},不能落子` });
-  }
-  if (room.turn !== ws._seat) {
-    return send(ws, 'error', { code: 'NOT_YOUR_TURN', message: `当前行动方是 ${room.turn}` });
-  }
-  if (msg.payload === undefined) {
-    return send(ws, 'error', { code: 'NO_PAYLOAD', message: 'move 需要 payload 字段' });
-  }
 
-  const record = { seat: ws._seat, payload: msg.payload, turnCount: room.turnCount + 1 };
-  room.history.push(record);
-  room.turnCount += 1;
-  room.turn = opponentSeat(room.turn);
-  await saveRoom(room);
+  let record = null;
+  const room = await withRoom(roomId, (room) => {
+    if (room.state !== 'playing') {
+      send(ws, 'error', { code: 'NOT_PLAYING', message: `当前房间状态为 ${room.state},不能落子` });
+      return false; // 校验失败,不落盘
+    }
+    if (room.turn !== ws._seat) {
+      send(ws, 'error', { code: 'NOT_YOUR_TURN', message: `当前行动方是 ${room.turn}` });
+      return false;
+    }
+    if (msg.payload === undefined) {
+      send(ws, 'error', { code: 'NO_PAYLOAD', message: 'move 需要 payload 字段' });
+      return false;
+    }
+    record = { seat: ws._seat, payload: msg.payload, turnCount: room.turnCount + 1 };
+    room.history.push(record);
+    room.turnCount += 1;
+    room.turn = opponentSeat(room.turn);
+  });
+  if (!room) return send(ws, 'error', { code: 'ROOM_NOT_FOUND', message: '房间不存在' });
+  if (!record) return; // 校验已在回调里发送了具体 error
+
   broadcastToRoom(room.id, 'move_made', {
     roomId: room.id,
     seat: record.seat,
@@ -436,12 +448,16 @@ function handleRelay(ws, msg) {
 async function handleGameOver(ws, msg) {
   const roomId = ws._roomId;
   if (!roomId) return send(ws, 'error', { code: 'NOT_IN_ROOM', message: '尚未加入房间' });
-  const room = await getRoom(roomId);
+
+  let alreadyOver = false;
+  const room = await withRoom(roomId, (room) => {
+    if (room.state === 'over') { alreadyOver = true; return false; } // 去重,不重复广播/落盘
+    room.state = 'over';
+    room.rematch = { A: false, B: false };
+  });
   if (!room) return send(ws, 'error', { code: 'ROOM_NOT_FOUND', message: '房间不存在' });
-  if (room.state === 'over') return;
-  room.state = 'over';
-  room.rematch = { A: false, B: false };
-  await saveRoom(room);
+  if (alreadyOver) return;
+
   broadcastToRoom(room.id, 'game_over', {
     roomId: room.id,
     winner: msg.winner ?? null,
@@ -454,13 +470,15 @@ async function handleGameOver(ws, msg) {
 async function handleRematch(ws) {
   const roomId = ws._roomId;
   if (!roomId) return send(ws, 'error', { code: 'NOT_IN_ROOM', message: '尚未加入房间' });
-  const room = await getRoom(roomId);
+
+  let notOver = false;
+  const room = await withRoom(roomId, (room) => {
+    if (room.state !== 'over') { notOver = true; return false; }
+    room.rematch[ws._seat] = true;
+  });
   if (!room) return send(ws, 'error', { code: 'ROOM_NOT_FOUND', message: '房间不存在' });
-  if (room.state !== 'over') {
-    return send(ws, 'error', { code: 'NOT_OVER', message: '对局尚未结束,不能请求再来一局' });
-  }
-  room.rematch[ws._seat] = true;
-  await saveRoom(room);
+  if (notOver) return send(ws, 'error', { code: 'NOT_OVER', message: '对局尚未结束,不能请求再来一局' });
+
   broadcastToRoom(room.id, 'rematch_state', {
     roomId: room.id,
     requested: ['A', 'B'].filter((s) => room.rematch[s]),

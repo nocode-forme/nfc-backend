@@ -6,15 +6,8 @@
 <title>对弈客户端(快速匹配)</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
-  background: #f4f1ea;
-  color: #333;
-  padding: 16px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-}  h1 { font-size: 18px; margin-bottom: 4px; }
+  body { font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; background: #f4f1ea; color: #333; padding: 16px; }
+  h1 { font-size: 18px; margin-bottom: 4px; }
   .hint { font-size: 12px; color: #888; margin-bottom: 12px; }
   .layout { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
   .panel { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px; }
@@ -161,29 +154,28 @@ function loadRecords() { try { return JSON.parse(localStorage.getItem(RKEY)) || 
 function saveRecords(r) { localStorage.setItem(RKEY, JSON.stringify(r.slice(0, 100))); }
 function addRecord(entry) { const r = loadRecords(); r.unshift(entry); saveRecords(r); renderRecords(); }
 function currentMoves() { return board.flat().filter(Boolean).length; }
-function recordResult(result) {
-  if (!mySeat || !startTime || recordedThisGame) return;
-  recordedThisGame = true;
-  addRecord({
+// recordResult 和 recordAbandonIfAny 的战绩条目字段完全一样,只有 result 和
+// dur 的兜底值不同,抽成一个共用构造函数,避免以后加字段要改两处。
+function buildRecordEntry(result, fallbackDur) {
+  return {
     t: Date.now(), room: roomId, mySeat,
     opp: opponentNick || '对手', result,
     mode: aiMode ? 'ai' : 'pvp',
     black: blackSeat || 'A',
     moves: currentMoves(),
-    dur: Math.max(1, Math.round((Date.now() - startTime) / 1000)),
-  });
+    dur: startTime ? Math.max(1, Math.round((Date.now() - startTime) / 1000)) : fallbackDur,
+  };
+}
+function recordResult(result) {
+  if (!mySeat || !startTime || recordedThisGame) return;
+  recordedThisGame = true;
+  addRecord(buildRecordEntry(result, 1));
   startTime = null;
 }
 function recordAbandonIfAny() {
   if (recordedThisGame || !mySeat || currentMoves() === 0) return;
   recordedThisGame = true;
-  addRecord({
-    t: Date.now(), room: roomId, mySeat,
-    opp: opponentNick || '对手', result: 'abort',
-    mode: aiMode ? 'ai' : 'pvp',
-    black: blackSeat || 'A',
-    moves: currentMoves(), dur: startTime ? Math.max(1, Math.round((Date.now() - startTime) / 1000)) : 1,
-  });
+  addRecord(buildRecordEntry('abort', 1));
   startTime = null;
 }
 function fmtDur(s) { return s >= 60 ? `${Math.floor(s / 60)}分${s % 60}秒` : `${s}秒`; }
@@ -300,6 +292,10 @@ function updateHud() {
   $('turnDot').className = curTurn ?? 'none';
   if (roomId) $('roomIdInput').value = roomId;
 }
+// updateHud/draw/setBtns 几乎总是一起调用(状态一变就要把三块 UI 全部刷新)。
+// 之前散落在各处各写一遍,容易漏掉其中一个;统一成 render() 一次调齐。
+// (函数声明会被提升,所以这里引用还没定义的 setBtns 没问题。)
+function render() { updateHud(); draw(); setBtns(); }
 function log(tag, text, cls = 'S') {
   const div = document.createElement('div');
   div.innerHTML = `<span class="tag ${cls}">${tag}</span> ${esc(text)}`;
@@ -342,7 +338,7 @@ function connect() {
     }
     playing = false; matching = false; pendingQuickMatch = false;
     mySeat = null; roomId = null; curTurn = null; opponentOnline = false;
-    updateHud(); draw(); setBtns();
+    render();
     if (loadSession() && reconnectTries < 10) {
       reconnectTries++;
       setStatus(`连接中断,自动重连中(第 ${reconnectTries}/10 次)…人机对局不受影响`, 'bad');
@@ -388,7 +384,7 @@ function startAIGame(playerBlack) {
   startTime = Date.now(); recordedThisGame = false;
   setStatus(playerBlack ? '🤖 人机对局开始,你执黑先行' : '🤖 人机对局开始,电脑执黑先行…', 'ok');
   log('SYS', `人机对局开始:你执${playerBlack ? '黑(先手)' : '白(后手)'},电脑${playerBlack ? '执白' : '执黑'}`);
-  updateHud(); draw(); setBtns();
+  render();
   if (curTurn === aiSeat) scheduleAi();
 }
 
@@ -400,7 +396,7 @@ function scheduleAi() {
 function aiMoveNow() {
   if (!aiMode || !playing || curTurn !== aiSeat) return;
   const mv = pickAiMove();
-  if (!mv) { showGameOver(null, 'board_full'); updateHud(); draw(); setBtns(); return; }
+  if (!mv) { showGameOver(null, 'board_full'); render(); return; }
   applyMove(aiSeat, mv.x, mv.y);
 }
 
@@ -478,7 +474,16 @@ function aiUndo() {
   lastMove = top ? { x: top.x, y: top.y } : null;
   setStatus('↩ 已悔棋,重新想想这手棋', 'ok');
   log('SYS', `悔棋:撤回 ${n} 手(人机对局不限次数)`);
-  updateHud(); draw(); setBtns();
+  render();
+}
+
+// 对局结束在人机模式下是"本地直接判定",在真人模式下是"上报服务器等广播回来"——
+// 调用方(落子入口、投降按钮)不需要各自记住这个分支,统一走这一个入口。
+function reportGameOver(winner, reason, payload) {
+  if (aiMode) { showGameOver(winner, reason); return; }
+  const extra = { winner, reason };
+  if (payload !== undefined) extra.payload = payload;
+  sendMsg('game_over', extra);
 }
 
 /* ================= 落子统一入口 ================= */
@@ -493,8 +498,7 @@ function applyMove(seat, x, y, turnCount) {
   if (won || full) {
     playing = false;
     cancelAiTimer();
-    if (aiMode) showGameOver(won ? seat : null, won ? 'five_in_row' : 'board_full');
-    else sendMsg('game_over', won ? { winner: seat, reason: 'five_in_row', payload: { x, y } } : { winner: null, reason: 'board_full' });
+    reportGameOver(won ? seat : null, won ? 'five_in_row' : 'board_full', won ? { x, y } : undefined);
   } else if (aiMode) {
     if (curTurn === aiSeat) scheduleAi();
     else setStatus('⚫ 轮到你落子', 'ok');
@@ -502,7 +506,7 @@ function applyMove(seat, x, y, turnCount) {
     if (playing && curTurn === mySeat) setStatus('⚫ 轮到你落子', 'ok');
     else if (playing) setStatus('⚪ 对方思考中…', 'wait');
   }
-  updateHud(); draw(); setBtns();
+  render();
 }
 
 function showGameOver(winner, reason) {
@@ -516,7 +520,7 @@ function showGameOver(winner, reason) {
   if (reason === 'resign') title = iWin ? '🏳 对方投降,你获胜!' : '🏳 你已投降';
   setStatus(`${title}(${reasonTxt})`, iWin || isDraw ? 'ok' : 'bad');
   log('SYS', `对局结束: ${isDraw ? '平局' : winner + ' 获胜'}(${reasonTxt}) — ${aiMode ? '点「再来一局」换边再战电脑' : '点「再来一局」同对手重开'}`);
-  updateHud(); draw(); setBtns();
+  render();
 }
 
 /* ================= 服务器消息处理 ================= */
@@ -533,17 +537,17 @@ function handleServer(m) {
       break;
 
     case 'match_found':
+      // saveSession() 不用在这里单独调:handleServer 末尾对每条消息都会统一调一次,
+      // 三处(match_found/room_created/room_joined)各自重复写反而容易漏改。
       leaveAiIfNeeded();
       matching = false;
       roomId = m.roomId; mySeat = m.yourSeat;
-      saveSession();
       log('SYS', `匹配成功!房间 ${m.roomId},你的座位 ${mySeat}(${mySeat === 'A' ? '黑/先手' : '白/后手'})`);
       break;
 
     case 'room_created':
       leaveAiIfNeeded();
       roomId = m.roomId; mySeat = m.yourSeat;
-      saveSession();
       setStatus(`房间 ${roomId} 已创建,等待对方加入(你是 A,先手)`, 'ok');
       log('SYS', `房间 ${roomId} 创建成功,你的座位 A`);
       break;
@@ -551,7 +555,6 @@ function handleServer(m) {
     case 'room_joined':
       leaveAiIfNeeded();
       roomId = m.roomId; mySeat = m.yourSeat;
-      saveSession();
       setStatus(`已加入房间 ${roomId},座位 ${mySeat}`, 'ok');
       break;
 
@@ -665,7 +668,7 @@ function handleServer(m) {
       }
       break;
   }
-  if (!aiMode) { updateHud(); draw(); setBtns(); saveSession(); }
+  if (!aiMode) { render(); saveSession(); }
 }
 
 /* ================= 按钮 ================= */
@@ -708,7 +711,7 @@ $('btnMatch').onclick = () => {
     if (playing && !confirm('离开人机对局去找真人?当前局将记为中断。')) return;
     recordAbandonIfAny();
     exitAIMode();
-    resetBoard(); draw(); updateHud(); setBtns();
+    resetBoard(); render();
     if (ws && ws.readyState === 1) { setStatus('正在匹配真人对手…', 'ok'); sendMsg('quick_match'); }
     else setStatus('未连接服务器:请先展开「高级 → 重连」,或直接点「人机对局」', 'bad');
     return;
@@ -756,13 +759,8 @@ $('btnLeave').onclick = () => {
 };
 $('btnResign').onclick = () => {
   if (!playing || !mySeat) return;
-  if (aiMode) {
-    if (confirm('确定投降吗?本局将判负并记入战绩。')) showGameOver(aiSeat, 'resign');
-    return;
-  }
-  if (confirm('确定投降吗?本局将判负并记入战绩。')) {
-    sendMsg('game_over', { winner: mySeat === 'A' ? 'B' : 'A', reason: 'resign' });
-  }
+  if (!confirm('确定投降吗?本局将判负并记入战绩。')) return;
+  reportGameOver(aiMode ? aiSeat : (mySeat === 'A' ? 'B' : 'A'), 'resign');
 };
 $('btnSend').onclick = () => {
   const t = $('msgbox').value.trim();
