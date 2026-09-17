@@ -165,13 +165,19 @@ function snapshot(room) {
 // ---------------- HTTP:托管网页客户端 ----------------
 // 统一的静态文件返回逻辑,避免每个路由重复一遍 readFile + 错误处理 + 响应头
 function serveFile(res, relPath, errMsg) {
+  serveStaticFile(res, relPath, 'text/html; charset=utf-8', errMsg);
+}
+
+// 和 serveFile 一样,但 Content-Type 可自定义——client.js 之类的静态资源
+// 不该被硬编码成 text/html。
+function serveStaticFile(res, relPath, contentType, errMsg) {
   const file = path.join(__dirname, 'web', relPath);
   fs.readFile(file, (err, buf) => {
     if (err) {
       res.writeHead(500);
       return res.end(errMsg);
     }
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.writeHead(200, { 'Content-Type': contentType, 'Cache-Control': 'no-store' });
     res.end(buf);
   });
 }
@@ -182,6 +188,10 @@ const server = http.createServer((req, res) => {
   }
   if (req.url === '/demo' || req.url === '/index.html') {
     return serveFile(res, 'index.html', 'client file missing');
+  }
+  if (req.url === '/client.js') {
+    // 通用网络客户端(连接/重连/会话持久化),index.html 依赖它
+    return serveStaticFile(res, 'client.js', 'application/javascript; charset=utf-8', 'client.js missing');
   }
   if (req.url.startsWith('/calibration.html')) {
     // startsWith 而非精确匹配:calibration.html 会带 ?mode=pvp/ai 查询参数
