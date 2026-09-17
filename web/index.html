@@ -128,9 +128,9 @@ body {
     </div>
   </div>
 
+<script src="client.js"></script>
 <script>
 /* ================= 状态 ================= */
-let ws = null;
 let mySeat = null;          // 'A' | 'B'
 let roomId = null;
 let board = [];             // 15x15: null | 'A' | 'B'
@@ -148,7 +148,6 @@ let pendingAIStart = false;    // 离开服务器房间后自动开始人机对�
 let startTime = null;       // 本局开始时间(算时长)
 let recordedThisGame = false;  // 本局是否已记入战绩(防重复记录)
 let blackSeat = null;       // 本局执黑(先手)的座位——服务器每局轮换,A 不一定执黑
-let reconnectTries = 0;
 const N = 15, CELL = 36, PAD = 18;
 const RKEY = 'utep_gomoku_records_v1';
 const NKEY = 'utep_gomoku_nick';
@@ -158,6 +157,9 @@ const SKEY = 'utep_gomoku_session'; // {roomId, seat} 断线重连凭据
 const $ = (id) => document.getElementById(id);
 const canvas = $('board'), ctx = canvas.getContext('2d');
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+/* ================= 通用网络客户端(见 client.js,和棋类逻辑完全无关) ================= */
+const client = new GameClient({ sessionKey: SKEY, getUrl: () => $('serverUrl').value.trim() });
 
 /* ================= 战绩(localStorage) ================= */
 function loadRecords() { try { return JSON.parse(localStorage.getItem(RKEY)) || []; } catch { return []; } }
@@ -208,16 +210,14 @@ function renderRecords() {
 
 /* ================= 会话持久化(断线回座) ================= */
 function saveSession() {
-  if (roomId && mySeat) localStorage.setItem(SKEY, JSON.stringify({ roomId, seat: mySeat, t: Date.now() }));
+  if (roomId && mySeat) client.saveSession({ roomId, seat: mySeat });
 }
 function loadSession() {
-  try {
-    const s = JSON.parse(localStorage.getItem(SKEY));
-    if (s && s.roomId && (s.seat === 'A' || s.seat === 'B')) return s;
-  } catch {}
+  const s = client.loadSession();
+  if (s && s.roomId && (s.seat === 'A' || s.seat === 'B')) return s;
   return null;
 }
-function clearSession() { localStorage.removeItem(SKEY); }
+function clearSession() { client.clearSession(); }
 
 /* ================= 棋盘绘制 ================= */
 function resetBoard() { board = Array.from({ length: N }, () => Array(N).fill(null)); lastMove = null; }
@@ -289,7 +289,7 @@ function checkWin(x, y) {
 
 /* ================= WebSocket ================= */
 function sendMsg(type, extra = {}) {
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type, ...extra }));
+  client.send(type, extra);
 }
 function setStatus(html, cls) {
   $('status').innerHTML = `<span class="${cls}">${html}</span>`;
@@ -315,53 +315,42 @@ function log(tag, text, cls = 'S') {
 const getNick = () => ($('nickInput').value.trim() || '玩家').slice(0, 20);
 const sendNick = () => { if (mySeat && opponentOnline && !aiMode) sendMsg('relay', { payload: { __nick: getNick() } }); };
 
-// 自动推断服务器地址:同源页面直接用当前 host,file:// 打开则回退本机
-function autoWsUrl() {
-  if (location.protocol.startsWith('http')) {
-    return `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`;
+/* ---- 把 GameClient 的连接生命周期接到这个具体游戏的状态/UI 上 ---- */
+client.onOpen = (session) => {
+  matching = false; pendingQuickMatch = false;
+  setBtns();
+  if (!aiMode) { resetBoard(); draw(); updateHud(); }
+  if (session && !mySeat) {
+    setStatus('检测到未完成的对局,正在回到座位…', 'wait');
+    sendMsg('join_room', { roomId: session.roomId, preferSeat: session.seat });
+  } else if (!aiMode) {
+    setStatus('已连接,点击「快速匹配」找真人,或「人机对局」离线玩', 'ok');
   }
-  return 'ws://localhost:8080';
-}
+};
+client.onClose = () => {
+  if (aiMode) {
+    setBtns();
+    setStatus(playing ? '⚠️ 服务器连接断开(人机对局不受影响)' : '已离线 · 人机对局可随时开始', playing ? 'wait' : 'ok');
+    return;
+  }
+  playing = false; matching = false; pendingQuickMatch = false;
+  mySeat = null; roomId = null; curTurn = null; opponentOnline = false;
+  render();
+};
+client.onReconnecting = (attempt, max) => {
+  if (!aiMode) setStatus(`连接中断,自动重连中(第 ${attempt}/${max} 次)…人机对局不受影响`, 'bad');
+};
+client.onGiveUp = () => {
+  if (!aiMode) setStatus('未连接(可点「🤖 人机对局」离线玩,或「高级 → 重连」)', 'bad');
+};
+client.onWsError = () => { if (!aiMode) setStatus('连接失败:确认服务器已启动(npm start)、端口正确', 'bad'); };
+client.onConnectError = () => setStatus('地址无效', 'bad');
+client.onMessage = (m) => handleServer(m);
 
 function connect() {
   const url = $('serverUrl').value.trim();
-  try { ws = new WebSocket(url); } catch { return setStatus('地址无效', 'bad'); }
   setStatus('连接中…', 'bad');
-  ws.onopen = () => {
-    reconnectTries = 0;
-    matching = false; pendingQuickMatch = false;
-    setBtns();
-    if (!aiMode) { resetBoard(); draw(); updateHud(); }
-    const s = loadSession();
-    if (s && !mySeat) {
-      setStatus('检测到未完成的对局,正在回到座位…', 'wait');
-      sendMsg('join_room', { roomId: s.roomId, preferSeat: s.seat });
-    } else if (!aiMode) {
-      setStatus('已连接,点击「快速匹配」找真人,或「人机对局」离线玩', 'ok');
-    }
-  };
-  ws.onclose = () => {
-    if (aiMode) {
-      setBtns();
-      setStatus(playing ? '⚠️ 服务器连接断开(人机对局不受影响)' : '已离线 · 人机对局可随时开始', playing ? 'wait' : 'ok');
-      return;
-    }
-    playing = false; matching = false; pendingQuickMatch = false;
-    mySeat = null; roomId = null; curTurn = null; opponentOnline = false;
-    render();
-    if (loadSession() && reconnectTries < 10) {
-      reconnectTries++;
-      setStatus(`连接中断,自动重连中(第 ${reconnectTries}/10 次)…人机对局不受影响`, 'bad');
-      setTimeout(connect, 3000);
-    } else {
-      setStatus('未连接(可点「🤖 人机对局」离线玩,或「高级 → 重连」)', 'bad');
-    }
-  };
-  ws.onerror = () => { if (!aiMode) setStatus('连接失败:确认服务器已启动(npm start)、端口正确', 'bad'); };
-  ws.onmessage = (e) => {
-    let m; try { m = JSON.parse(e.data); } catch { return; }
-    handleServer(m);
-  };
+  client.connect(url);
 }
 
 function clearRematchFlags() { rematchByMe = false; rematchByOpponent = false; }
@@ -683,7 +672,7 @@ function handleServer(m) {
 
 /* ================= 按钮 ================= */
 function setBtns() {
-  const connected = !!(ws && ws.readyState === 1);
+  const connected = client.connected;
   if (aiMode) {
     $('btnMatch').disabled = playing;
     $('btnMatch').textContent = '⚡ 找真人对战';
@@ -722,7 +711,7 @@ $('btnMatch').onclick = () => {
     recordAbandonIfAny();
     exitAIMode();
     resetBoard(); render();
-    if (ws && ws.readyState === 1) { setStatus('正在匹配真人对手…', 'ok'); sendMsg('quick_match'); }
+    if (client.connected) { setStatus('正在匹配真人对手…', 'ok'); sendMsg('quick_match'); }
     else setStatus('未连接服务器:请先展开「高级 → 重连」,或直接点「人机对局」', 'bad');
     return;
   }
@@ -750,7 +739,7 @@ $('btnRematch').onclick = () => {
 };
 $('btnCancelMatch').onclick = () => sendMsg('cancel_match');
 $('btnUndo').onclick = () => aiUndo();
-$('btnConnect').onclick = () => { if (ws) ws.close(); reconnectTries = 0; setTimeout(connect, 200); };
+$('btnConnect').onclick = () => client.reconnectNow($('serverUrl').value.trim());
 $('btnCreate').onclick = () => sendMsg('create_room');
 $('btnJoin').onclick = () => {
   const id = $('roomIdInput').value.trim();
@@ -791,7 +780,7 @@ $('btnClearRecords').onclick = () => {
 };
 
 /* ================= init:自动连接(失败也不影响人机对局) ================= */
-$('serverUrl').value = autoWsUrl();
+$('serverUrl').value = GameClient.autoUrl();
 $('nickInput').value = localStorage.getItem(NKEY) || '';
 renderRecords();
 resetBoard(); draw(); setBtns();
