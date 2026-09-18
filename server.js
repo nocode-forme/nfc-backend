@@ -23,6 +23,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 const { createClient } = require('redis');
+const { GameRules } = require('./game_rules');
 
 const PORT = process.env.PORT || 8080;
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
@@ -31,14 +32,22 @@ const RESUME_TIMEOUT_MS = Number(process.env.RESUME_TIMEOUT_MS || 30 * 60 * 1000
 const ROOM_KEY_PREFIX = 'gomoku:room:';
 const ROOM_TTL_SEC = Math.ceil(RESUME_TIMEOUT_MS / 1000) + 60; // 比保留期稍长一点做缓冲
 
+// 目前支持的棋类。每条连接建立后必须先选择其中之一,选定后本次连接
+// 生命周期内不可更改;房间也会带上这个字段,加入房间时要求棋类一致。
+const VALID_GAME_TYPES = ['wuziqi', 'xiangqi'];
+
 // ---------------- Redis 连接 ----------------
 const redis = createClient({ url: REDIS_URL });
 redis.on('error', (err) => console.error('[redis] error:', err));
 
+// ---------------- 棋类规则(合法性复核,与回合归属校验分开) ----------------
+const gameRules = new GameRules();
+
 // ---------------- 房间模型(元数据存 Redis,socket 引用存本地) ----------------
 // Redis 里的 room 结构(纯 JSON,可序列化):
 // {
-//   id, turn: 'A'|'B'|null, turnCount, history: [{seat,payload,turnCount}],
+//   id, gameType: 'wuziqi'|'xiangqi', turn: 'A'|'B'|null, turnCount,
+//   history: [{seat,payload,turnCount}],
 //   state: 'waiting'|'playing'|'over',
 //   rematch: { A: bool, B: bool },
 //   firstMover: 'A'|'B',
@@ -153,6 +162,7 @@ function broadcastToRoom(roomId, type, data = {}) {
 function snapshot(room) {
   return {
     roomId: room.id,
+    gameType: room.gameType,
     state: room.state,
     turn: room.turn,
     turnCount: room.turnCount,
@@ -165,19 +175,13 @@ function snapshot(room) {
 // ---------------- HTTP:托管网页客户端 ----------------
 // 统一的静态文件返回逻辑,避免每个路由重复一遍 readFile + 错误处理 + 响应头
 function serveFile(res, relPath, errMsg) {
-  serveStaticFile(res, relPath, 'text/html; charset=utf-8', errMsg);
-}
-
-// 和 serveFile 一样,但 Content-Type 可自定义——client.js 之类的静态资源
-// 不该被硬编码成 text/html。
-function serveStaticFile(res, relPath, contentType, errMsg) {
   const file = path.join(__dirname, 'web', relPath);
   fs.readFile(file, (err, buf) => {
     if (err) {
       res.writeHead(500);
       return res.end(errMsg);
     }
-    res.writeHead(200, { 'Content-Type': contentType, 'Cache-Control': 'no-store' });
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
     res.end(buf);
   });
 }
@@ -188,10 +192,6 @@ const server = http.createServer((req, res) => {
   }
   if (req.url === '/demo' || req.url === '/index.html') {
     return serveFile(res, 'index.html', 'client file missing');
-  }
-  if (req.url === '/client.js') {
-    // 通用网络客户端(连接/重连/会话持久化),index.html 依赖它
-    return serveStaticFile(res, 'client.js', 'application/javascript; charset=utf-8', 'client.js missing');
   }
   if (req.url.startsWith('/calibration.html')) {
     // startsWith 而非精确匹配:calibration.html 会带 ?mode=pvp/ai 查询参数
@@ -207,6 +207,7 @@ const server = http.createServer((req, res) => {
         const r = JSON.parse(raw);
         list.push({
           roomId: r.id,
+          gameType: r.gameType,
           state: r.state,
           players: (r.seatsOccupied.A ? 1 : 0) + (r.seatsOccupied.B ? 1 : 0),
           turn: r.turn,
@@ -230,6 +231,9 @@ const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws) => {
   ws.isAlive = true;
+  // 本次连接尚未选择棋类;必须先发 select_game 选定后才能创建/加入房间、快速匹配。
+  // 一旦选定就锁定,不允许中途更改(想换棋类需要断线重连)。
+  ws._gameType = null;
   ws.on('pong', () => (ws.isAlive = true));
   ws.on('message', async (raw) => {
     let msg;
@@ -276,23 +280,32 @@ async function handleQuickMatch(ws) {
   if (ws._roomId) {
     return send(ws, 'error', { code: 'ALREADY_IN_ROOM', message: '已在房间中,请先 leave' });
   }
+  if (!requireGameType(ws)) return;
   if (waitingQueue.includes(ws)) {
     return send(ws, 'match_waiting', {});
   }
+  // 只和选了同一棋类的人配对。棋类不同但仍有效的候选者要放回队首,
+  // 保持它们原本的排队顺序,不能被这次匹配悄悄跳过。
   let partner = null;
+  const skipped = [];
   while (waitingQueue.length) {
     const cand = waitingQueue.shift();
-    if (cand.readyState === cand.OPEN && !cand._roomId) {
-      partner = cand;
-      break;
+    if (cand.readyState !== cand.OPEN || cand._roomId) continue; // 失效连接,直接丢弃
+    if (cand._gameType !== ws._gameType) {
+      skipped.push(cand);
+      continue;
     }
+    partner = cand;
+    break;
   }
+  if (skipped.length) waitingQueue.unshift(...skipped);
   if (!partner) {
     waitingQueue.push(ws);
     return send(ws, 'match_waiting', {});
   }
   const room = {
     id: newRoomId(),
+    gameType: ws._gameType,
     turn: null,
     turnCount: 0,
     history: [],
@@ -305,8 +318,8 @@ async function handleQuickMatch(ws) {
   await saveRoom(room);
   await joinSeat(room, partner, 'A');
   await joinSeat(room, ws, 'B');
-  send(partner, 'match_found', { roomId: room.id, yourSeat: 'A' });
-  send(ws, 'match_found', { roomId: room.id, yourSeat: 'B' });
+  send(partner, 'match_found', { roomId: room.id, yourSeat: 'A', gameType: room.gameType });
+  send(ws, 'match_found', { roomId: room.id, yourSeat: 'B', gameType: room.gameType });
   await startNewGame(room);
   console.log(`[room ${room.id}] quick match: A+B paired`);
 }
@@ -319,6 +332,8 @@ function handleCancelMatch(ws) {
 
 async function handle(ws, msg) {
   switch (msg.type) {
+    case 'select_game':
+      return handleSelectGame(ws, msg);
     case 'quick_match':
       return handleQuickMatch(ws);
     case 'cancel_match':
@@ -344,12 +359,41 @@ async function handle(ws, msg) {
   }
 }
 
+// 选棋类是进房间前的前置步骤:未选择时拒绝一切创建/加入/匹配请求。
+function requireGameType(ws) {
+  if (!ws._gameType) {
+    send(ws, 'error', { code: 'GAME_NOT_SELECTED', message: '请先发送 select_game 选择棋类(wuziqi/xiangqi)' });
+    return false;
+  }
+  return true;
+}
+
+function handleSelectGame(ws, msg) {
+  if (ws._gameType) {
+    return send(ws, 'error', {
+      code: 'GAME_ALREADY_SELECTED',
+      message: `本次连接已选择棋类:${ws._gameType},不可更改(如需更换请重新连接)`,
+    });
+  }
+  const gameType = msg.gameType;
+  if (!VALID_GAME_TYPES.includes(gameType)) {
+    return send(ws, 'error', {
+      code: 'BAD_GAME_TYPE',
+      message: `不支持的棋类:${gameType},可选:${VALID_GAME_TYPES.join('/')}`,
+    });
+  }
+  ws._gameType = gameType;
+  send(ws, 'game_selected', { gameType });
+}
+
 async function handleCreate(ws) {
   if (ws._roomId) {
     return send(ws, 'error', { code: 'ALREADY_IN_ROOM', message: '已在房间中,请先 leave' });
   }
+  if (!requireGameType(ws)) return;
   const room = {
     id: newRoomId(),
+    gameType: ws._gameType,
     turn: null,
     turnCount: 0,
     history: [],
@@ -361,7 +405,7 @@ async function handleCreate(ws) {
   };
   await saveRoom(room);
   await joinSeat(room, ws, 'A');
-  send(ws, 'room_created', { roomId: room.id, yourSeat: 'A' });
+  send(ws, 'room_created', { roomId: room.id, yourSeat: 'A', gameType: room.gameType });
   console.log(`[room ${room.id}] created by seat A`);
 }
 
@@ -369,8 +413,15 @@ async function handleJoin(ws, msg) {
   if (ws._roomId) {
     return send(ws, 'error', { code: 'ALREADY_IN_ROOM', message: '已在房间中,请先 leave' });
   }
+  if (!requireGameType(ws)) return;
   const room = await getRoom(String(msg.roomId || '').toUpperCase());
   if (!room) return send(ws, 'error', { code: 'ROOM_NOT_FOUND', message: '房间不存在' });
+  if (room.gameType !== ws._gameType) {
+    return send(ws, 'error', {
+      code: 'GAME_TYPE_MISMATCH',
+      message: `该房间是 ${room.gameType} 房间,你选择的是 ${ws._gameType},无法加入`,
+    });
+  }
 
   const prefer = msg.preferSeat === 'A' || msg.preferSeat === 'B' ? msg.preferSeat : null;
   const freeSeat =
@@ -378,7 +429,7 @@ async function handleJoin(ws, msg) {
   if (!freeSeat) return send(ws, 'error', { code: 'ROOM_FULL', message: '房间已满' });
 
   await joinSeat(room, ws, freeSeat);
-  send(ws, 'room_joined', { roomId: room.id, yourSeat: freeSeat });
+  send(ws, 'room_joined', { roomId: room.id, yourSeat: freeSeat, gameType: room.gameType });
 
   const both = room.seatsOccupied.A && room.seatsOccupied.B;
   if (both && room.state !== 'over') {
@@ -431,6 +482,13 @@ async function handleMove(ws, msg) {
     }
     if (msg.payload === undefined) {
       send(ws, 'error', { code: 'NO_PAYLOAD', message: 'move 需要 payload 字段' });
+      return false;
+    }
+    // 合法性复核:是否轮到你、房间状态是否 playing —— 上面已经查过;
+    // 这一步棋本身站不站得住脚,交给 game_rules.js 判断
+    const legality = gameRules.isLegal(room, ws._seat, msg.payload);
+    if (!legality.legal) {
+      send(ws, 'error', { code: 'ILLEGAL', message: legality.message || '不合法的落子' });
       return false;
     }
     record = { seat: ws._seat, payload: msg.payload, turnCount: room.turnCount + 1 };
