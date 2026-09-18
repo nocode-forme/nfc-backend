@@ -186,6 +186,46 @@ function serveFile(res, relPath, errMsg) {
   });
 }
 
+// 通用静态文件回退:client.js、样式、图片等资源都从这里兜底,
+// 不用像上面那样每加一个文件就手写一条路由。做了两件安全相关的事:
+//   1. 用 path.normalize + startsWith 校验解析后的路径仍在 web/ 目录内,
+//      防止 ../../etc/passwd 这类路径穿越
+//   2. 按后缀给出合适的 Content-Type,不认识的后缀退回 octet-stream
+const STATIC_MIME = {
+  '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.html': 'text/html; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.woff2': 'font/woff2',
+};
+
+function serveStatic(req, res) {
+  const webRoot = path.join(__dirname, 'web');
+  const urlPath = decodeURIComponent(req.url.split('?')[0]);
+  const filePath = path.normalize(path.join(webRoot, urlPath));
+  if (!filePath.startsWith(webRoot)) {
+    res.writeHead(403);
+    return res.end('forbidden');
+  }
+  fs.readFile(filePath, (err, buf) => {
+    if (err) {
+      res.writeHead(404);
+      return res.end('not found');
+    }
+    const ext = path.extname(filePath).toLowerCase();
+    res.writeHead(200, {
+      'Content-Type': STATIC_MIME[ext] || 'application/octet-stream',
+      'Cache-Control': 'no-store',
+    });
+    res.end(buf);
+  });
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === '/' || req.url === '/landing.html') {
     return serveFile(res, 'landing.html', 'landing page missing');
@@ -222,8 +262,7 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
-  res.writeHead(404);
-  res.end('not found');
+  serveStatic(req, res);
 });
 
 // ---------------- WebSocket ----------------

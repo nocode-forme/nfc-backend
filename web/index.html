@@ -320,6 +320,12 @@ client.onOpen = (session) => {
   matching = false; pendingQuickMatch = false;
   setBtns();
   if (!aiMode) { resetBoard(); draw(); updateHud(); }
+  // 服务器现在要求每条连接先选棋类才能创建/加入房间、快速匹配——
+  // 这个页面本身就是五子棋 Demo,所以直接固定发 wuziqi,不用问用户选。
+  // JS 单线程 + handleSelectGame 内部无 await,服务器会在处理下一条消息
+  // 前同步地把 ws._gameType 设好,所以这里不用等 game_selected 回包
+  // 就能紧接着发 join_room/quick_match。
+  sendMsg('select_game', { gameType: 'wuziqi' });
   if (session && !mySeat) {
     setStatus('检测到未完成的对局,正在回到座位…', 'wait');
     sendMsg('join_room', { roomId: session.roomId, preferSeat: session.seat });
