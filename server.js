@@ -1,19 +1,19 @@
 /**
- * 对弈原型服务器(Redis 版)
+ * 对弈原型服务器(内存版)
  * 职责:回合制调度 + 数据透传 + 局内元数据维护
  * 非职责:AI 决策、胜负判定、渲染、业务数据格式定义(全部由客户端自理)
  *
- * 改动说明:
- *   房间的「元数据」(turn/history/state/rematch/...)现在存在 Redis 里,
- *   服务器重启、崩溃、pm2 restart 都不会丢失正在进行的对局。
+ * 存储说明:
+ *   房间「元数据」(turn/history/state/rematch/...)和 WebSocket 连接引用
+ *   现在都只存在本进程内存里(一个 Map)。没有外部依赖、没有网络往返。
  *
- *   但 WebSocket 连接本身(ws 对象)无法序列化进 Redis —— 一个连接只属于
- *   当前这一个 Node 进程。所以「谁的 socket 坐在哪个座位」仍然只放在本地
- *   内存的 socketsByRoom 里,不进 Redis。
+ *   代价:server.js 进程重启/崩溃/pm2 restart 会丢失所有正在进行的对局
+ *   ——这对这个原型是可接受的(房间本来就设计成一次性的、可随时重开)。
+ *   如果以后要跨进程扩容或要求重启不丢局,再把 rooms 这个 Map 换成外部
+ *   存储(Redis 之类)即可,其余代码不用大改。
  *
- *   换句话说:断线后房间的棋局状态从 Redis 读回来,但重连的人必须连回
- *   同一台服务器进程,座位才能重新绑定上——这对单机部署完全没问题,
- *   多机横向扩展则需要额外的会话粘滞(sticky session)方案,这里先不做。
+ *   WebSocket 连接本身天然只属于当前进程,所以「谁的 socket 坐在哪个座位」
+ *   放在本地内存的 socketsByRoom 里,这一点和之前一样没变。
  *
  * 通信:WebSocket + JSON,消息统一形如 { "type": "...", ...字段 }
  */
@@ -22,29 +22,21 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
-const { createClient } = require('redis');
 const { GameRules } = require('./game_rules');
 
 const PORT = process.env.PORT || 8080;
-const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 // 断线后房间保留多久(毫秒):期间重新入座可继续没下完的局,超时则释放房间
 const RESUME_TIMEOUT_MS = Number(process.env.RESUME_TIMEOUT_MS || 30 * 60 * 1000);
-const ROOM_KEY_PREFIX = 'gomoku:room:';
-const ROOM_TTL_SEC = Math.ceil(RESUME_TIMEOUT_MS / 1000) + 60; // 比保留期稍长一点做缓冲
 
 // 目前支持的棋类。每条连接建立后必须先选择其中之一,选定后本次连接
 // 生命周期内不可更改;房间也会带上这个字段,加入房间时要求棋类一致。
 const VALID_GAME_TYPES = ['wuziqi', 'xiangqi'];
 
-// ---------------- Redis 连接 ----------------
-const redis = createClient({ url: REDIS_URL });
-redis.on('error', (err) => console.error('[redis] error:', err));
-
 // ---------------- 棋类规则(合法性复核,与回合归属校验分开) ----------------
 const gameRules = new GameRules();
 
-// ---------------- 房间模型(元数据存 Redis,socket 引用存本地) ----------------
-// Redis 里的 room 结构(纯 JSON,可序列化):
+// ---------------- 房间模型(元数据 + socket 引用都在本地内存) ----------------
+// room 结构:
 // {
 //   id, gameType: 'wuziqi'|'xiangqi', turn: 'A'|'B'|null, turnCount,
 //   history: [{seat,payload,turnCount}],
@@ -54,25 +46,25 @@ const gameRules = new GameRules();
 //   seatsOccupied: { A: bool, B: bool },  // 只记录"是否有人坐",不存 ws 本身
 //   createdAt
 // }
+const rooms = new Map(); // roomId -> room object
 //
-// socketsByRoom: Map<roomId, { A: ws|null, B: ws|null }>  —— 本地内存,不落 Redis
+// socketsByRoom: Map<roomId, { A: ws|null, B: ws|null }>
 const socketsByRoom = new Map();
 
 function newRoomId() {
   return crypto.randomBytes(3).toString('hex').toUpperCase();
 }
 
-async function getRoom(roomId) {
-  const raw = await redis.get(ROOM_KEY_PREFIX + roomId);
-  return raw ? JSON.parse(raw) : null;
+function getRoom(roomId) {
+  return rooms.get(roomId) || null;
 }
 
-async function saveRoom(room) {
-  await redis.set(ROOM_KEY_PREFIX + room.id, JSON.stringify(room), { EX: ROOM_TTL_SEC });
+function saveRoom(room) {
+  rooms.set(room.id, room);
 }
 
-async function deleteRoom(roomId) {
-  await redis.del(ROOM_KEY_PREFIX + roomId);
+function deleteRoom(roomId) {
+  rooms.delete(roomId);
   socketsByRoom.delete(roomId);
 }
 
@@ -107,22 +99,22 @@ async function joinSeat(room, ws, seat) {
 }
 
 // 有人离座后启动保留计时:超时仍缺人才真正释放房间
-// 注意:这个计时器只存在于本进程内存中,不经过 Redis —— 如果服务器在计时
-// 期间重启,计时会丢失(房间元数据本身还在 Redis,只是不会自动过期清理,
-// 靠 ROOM_TTL_SEC 的 Redis 原生过期兜底)。
+// 这个计时器只存在于本进程内存中——如果服务器在计时期间重启,计时会丢失,
+// 但房间元数据本来也只在内存里,重启同样会清空,所以两者是一致的,不存在
+// "计时器丢了但房间还占着内存不释放"的不一致情况。
 const expiryTimers = new Map(); // roomId -> Timeout
 
 function armExpiry(room) {
   const existing = expiryTimers.get(room.id);
   if (existing) clearTimeout(existing);
-  const timer = setTimeout(async () => {
-    const current = await getRoom(room.id);
+  const timer = setTimeout(() => {
+    const current = getRoom(room.id);
     if (!current) return;
     const sockets = getSockets(room.id);
     if (!current.seatsOccupied.A || !current.seatsOccupied.B) {
       const rest = sockets.A || sockets.B;
       if (rest) send(rest, 'room_expired', { roomId: room.id });
-      await deleteRoom(room.id);
+      deleteRoom(room.id);
       expiryTimers.delete(room.id);
       console.log(`[room ${room.id}] expired (seat empty over ${RESUME_TIMEOUT_MS}ms)`);
     }
@@ -238,28 +230,20 @@ const server = http.createServer((req, res) => {
     return serveFile(res, 'calibration.html', 'calibration page missing');
   }
   if (req.url === '/api/rooms') {
-    // 调试用:列出 Redis 里所有房间(scan 而非 keys,避免大量房间时阻塞)
-    (async () => {
-      const list = [];
-      for await (const key of redis.scanIterator({ MATCH: ROOM_KEY_PREFIX + '*' })) {
-        const raw = await redis.get(key);
-        if (!raw) continue;
-        const r = JSON.parse(raw);
-        list.push({
-          roomId: r.id,
-          gameType: r.gameType,
-          state: r.state,
-          players: (r.seatsOccupied.A ? 1 : 0) + (r.seatsOccupied.B ? 1 : 0),
-          turn: r.turn,
-          turnCount: r.turnCount,
-        });
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(list));
-    })().catch((err) => {
-      res.writeHead(500);
-      res.end(String(err));
-    });
+    // 调试用:列出内存里所有房间
+    const list = [];
+    for (const r of rooms.values()) {
+      list.push({
+        roomId: r.id,
+        gameType: r.gameType,
+        state: r.state,
+        players: (r.seatsOccupied.A ? 1 : 0) + (r.seatsOccupied.B ? 1 : 0),
+        turn: r.turn,
+        turnCount: r.turnCount,
+      });
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(list));
     return;
   }
   serveStatic(req, res);
@@ -639,13 +623,9 @@ setInterval(() => {
 }, 30000);
 
 // ---------------- 启动 ----------------
-(async () => {
-  await redis.connect();
-  console.log(`[redis] connected: ${REDIS_URL}`);
-  server.listen(PORT, () => {
-    console.log(`对弈服务器已启动(Redis 版):`);
-    console.log(`  网页客户端  http://localhost:${PORT}`);
-    console.log(`  WebSocket   ws://localhost:${PORT}`);
-    console.log(`  房间调试    http://localhost:${PORT}/api/rooms`);
-  });
-})();
+server.listen(PORT, () => {
+  console.log(`对弈服务器已启动(内存版):`);
+  console.log(`  网页客户端  http://localhost:${PORT}`);
+  console.log(`  WebSocket   ws://localhost:${PORT}`);
+  console.log(`  房间调试    http://localhost:${PORT}/api/rooms`);
+});
